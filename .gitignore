@@ -1,0 +1,21 @@
+# 构建产物
+build_output/
+dist/
+*.spec
+
+# 打包分发的自解压安装包与压缩包
+nvlink_status_collect_install.sh
+*.tar.gz
+
+# 运行日志
+logs/
+*.log
+
+# 本地工具配置
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

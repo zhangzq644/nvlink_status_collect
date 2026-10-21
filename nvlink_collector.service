@@ -1,0 +1,22 @@
+[Unit]
+Description=NVLink Status Collector for Prometheus node_exporter
+Documentation=https://github.com/paratera/nvlink_status_collect
+After=network.target
+
+[Service]
+Type=simple
+Environment=PYTHONPATH=/usr/local/bin/nvlink_lib
+ExecStart=/usr/local/bin/nvlink_collector.py --interval 30 --output /usr/local/node_exporter/extra_metrics_custom/nvlink_status.prom
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/usr/local/node_exporter/extra_metrics_custom
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

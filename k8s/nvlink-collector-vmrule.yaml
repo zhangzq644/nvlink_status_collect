@@ -1,0 +1,76 @@
+# NVLink 告警规则 - Victoria Metrics VMRule
+#
+# 部署: kubectl apply -f k8s/nvlink-collector-vmrule.yaml
+#
+# 适配说明:
+#   - apiVersion 遵循集群现有 vmrule 惯例 (mon-alert-custom-rules-*.rules 同款)
+#   - vmalert vmc-mon-vmstack 配置 selectAllByDefault=true, mon ns 内的
+#     VMRule 会被自动加载, 无需改 vmalert CR
+#   - 告警命名遵循集群惯例 discoverd_ 前缀, summary 中文并带节点名
+#   - severity 全部先设为 warning: 因集群 2026-10 新上线 alert-node-quarantine
+#     (告警驱动的节点自动隔离), 避免新告警误触自动化隔离动作; 稳定运行一个
+#     观察期后再按模板评估是否升级 critical
+#   - 阈值校验: vmagent scrapeInterval=20s, NVLinkMetricsStale 判定 >120s
+#     (6 个抓取周期), 裸机版语义原样保留
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMRule
+metadata:
+  name: mon-alert-custom-rules-nvlink.rules
+  namespace: mon
+  labels:
+    app.kubernetes.io/part-of: nvlink-monitoring
+spec:
+  groups:
+    - name: custom-rules-nvlink.rules
+      interval: 30s
+      rules:
+        # 1. 单 GPU 全部 NVLink 链路 inactive (硬件/驱动故障的强信号)
+        # 节点标识实测定论 (2026-10-21 灰度首查): textfile 指标不携带
+        # nodename/node label, 节点身份由 vmagent 注入的 instance 承载
+        # (形如 "10.25.2.195:9100")。模板用 instance 呈现。
+        - alert: discoverd_nvlink_all_links_inactive
+          expr: nvlink_gpu_active_links == 0
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "节点: {{ $labels.instance }} | GPU {{ $labels.gpu }} ({{ $labels.gpu_model }}) 全部 NVLink 链路 inactive"
+            description: "GPU {{ $labels.gpu }} 活跃 NVLink 链路数为 0, 疑似硬件或驱动故障, 请在节点上执行 nvidia-smi nvlink -s 复核"
+
+        # 2. 采集脚本执行失败 (NVML init 失败、无 GPU 等)
+        - alert: discoverd_nvlink_scrape_error
+          expr: nvlink_scrape_error == 1
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: "节点: {{ $labels.instance }} | NVLink 采集失败 scrape_error=1"
+            description: "nvlink_collector 采集失败, 请检查: kubectl -n mon logs ds/nvlink-collector、节点 NVIDIA 驱动状态 (nvidia-smi)"
+
+        # 3. 采集管线停更 (进程挂死被 liveness 杀掉后反复重启失败、
+        #    node_exporter 读不到目录、磁盘满等 scrape_error 无法覆盖的场景)
+        #    注意: 此告警比 scrape_error 更本质——它检测的是
+        #    nvlink_last_collection_timestamp 的"最后一次尝试"语义
+        - alert: discoverd_nvlink_metrics_stale
+          expr: time() - nvlink_last_collection_timestamp > 120
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: "节点: {{ $labels.instance }} | NVLink 指标超过 2 分钟未更新"
+            description: "nvlink 指标停更, 可能原因: 采集进程挂死反复重启 (kubectl -n mon get pod -l app=nvlink-collector 看 RESTARTS)、node_exporter textfile 目录配置缺失、磁盘满。时间戳语义为'最后一次采集尝试'——停更意味着管线死亡而非仅采集失败"
+
+        # 4. NVLink 错误计数增长 (CRC/Replay/Recovery/ECC, 链路质量劣化前兆)
+        - alert: discoverd_nvlink_errors_detected
+          expr: >-
+            increase(nvlink_link_error_crc_data[5m]) > 0
+            or increase(nvlink_link_error_crc_flit[5m]) > 0
+            or increase(nvlink_link_error_replay[5m]) > 0
+            or increase(nvlink_link_error_recovery[5m]) > 0
+            or increase(nvlink_link_error_ecc_data[5m]) > 0
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: "节点: {{ $labels.instance }} | GPU {{ $labels.gpu }} link {{ $labels.link }} NVLink 错误计数增长"
+            description: "NVLink 错误计数 (crc/replay/recovery/ecc) 出现增长, 链路信号质量可能劣化, 请关注是否伴随 xid 错误或掉卡告警"

@@ -1,0 +1,159 @@
+# NVLink Status Collector - Kubernetes DaemonSet 部署清单
+#
+# 适用集群: zz1-shengshu1 (Victoria Metrics 监控栈 + GPU Operator)
+#
+# 部署:  kubectl apply -f k8s/nvlink-collector-daemonset.yaml
+# 卸载:  kubectl delete -f k8s/nvlink-collector-daemonset.yaml
+#
+# 状态 (2026-10-21): 已完成 2 节点灰度验证 (pod2-b200gpu95/pod11-b300gpu20),
+#   六层验证全部通过 (采集日志/宿主机落盘/node_exporter 暴露/VM 落库 288 序列
+#   精确匹配/DCGM 交叉信源), 灰度详见 CANARY_CHECKLIST.md
+#   灰度执行的 YAML 为 nvlink-collector-daemonset-canary.yaml (多 nodeAffinity
+#   点名段), 本文件为其放量版本 (去掉点名 = 全部 GPU 节点)
+#
+# 前提条件:
+#   1. 镜像已推送: registry.cn-beijing.aliyuncs.com/prtr/nvlink_collector:1.0.0
+#      (与 node_exporter 同仓库, linux/amd64, 灰度节点实测采集成功)
+#   2. node_exporter (Helm release vmc-mon, rev10) textfile 目录参数与 hostPath
+#      挂载已上线 (34/34 副本), 本清单不依赖但消费该目录
+#   3. nvidia RuntimeClass 可用 (集群已具备: gpu-operator/cluster-policy ready)
+#   4. 拉取凭据: mon ns 的 aliyun-yht-private (prtr 私有仓库必需, 灰度已验证)
+#
+# 与裸机版差异:
+#   - 无 cron/--once/timeout 看门狗: DaemonSet 常驻循环模式, 单实例由 k8s 保证
+#   - flock 锁保留: 防御节点上可能的裸机版残留进程双写 (迁移期保护)
+#   - livenessProbe 检查 .prom mtime: 替代 timeout -k 看门狗, 检测 NVML ioctl
+#     挂死 (SIGTERM 无效场景) → 宽限期后 kubelet SIGKILL, 与裸机三层防护同构
+#
+# 放量验证基线 (灰度实测): 29 GPU 节点 × 8 卡 × 18 链路 → 全量后
+#   count(nvlink_link_state) ≈ 4176, count(nvlink_gpu_active_links) = 232
+#   指标 label 中节点身份为 instance ("节点IP:9100"), 而非 nodename
+#   (VMRule 告警模板已按此适配)
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvlink-collector
+  namespace: mon
+  labels:
+    app: nvlink-collector
+    app.kubernetes.io/name: nvlink-collector
+    app.kubernetes.io/part-of: nvlink-monitoring
+spec:
+  selector:
+    matchLabels:
+      app: nvlink-collector
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: nvlink-collector
+        app.kubernetes.io/name: nvlink-collector
+    spec:
+      # 仅调度到 GPU 节点 (节点标签 nvidia.com/gpu.present=true 由 GPU Operator
+      # 的 gpu-feature-discovery DS 打上, 29 个 B200/B300 节点全部具备——含
+      # SchedulingDisabled 的 pod12-b200gpu78, 该节点 DS 不会落地, 无需处理)
+      # GPU 节点实测无 taint, tolerations 为防御性配置
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      # prtr 为私有仓库, 集群拉取凭据与 node_exporter/gpfs-exporter 相同
+      imagePullSecrets:
+        - name: aliyun-yht-private
+      # NVML 注入机制 (2026-10-20 在 pod2-b200gpu95 实测验证):
+      #   该集群 nvidia runtime 注入由容器内 env 声明触发 ——
+      #   NVIDIA_VISIBLE_DEVICES=all + NVIDIA_DRIVER_CAPABILITIES=utility
+      #   仅设 runtimeClassName 而无 env 时, 容器拿不到 libnvidia-ml.so
+      #   (报 NVML Shared Library Not Found)
+      #   对比: dcgm-exporter 用的是 privileged+hostPath 方案, 本方案更轻量
+      runtimeClassName: nvidia
+      priorityClassName: system-node-critical
+      terminationGracePeriodSeconds: 10
+      tolerations:
+        # GPU 节点当前无 taint, 此项为防御性配置, 防止未来加污点后 collector 失联
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        # 灰度实测发现该集群 GPU 节点存在带 effect: NoExecute 的管理性 taint
+        # 场景 (如 pod12-b200gpu78 曾出现 SchedulingDisabled), NoExecute 不被
+        # 上面的 NoSchedule toleration 覆盖, 补一条通用容错保证监控omer不因
+        # 管理操作失联
+        - operator: Exists
+          effect: NoExecute
+      containers:
+        - name: collector
+          # 仓库与 node_exporter 相同: registry.cn-beijing.aliyuncs.com/prtr/
+          # linux/amd64, tag 1.0.0
+          image: registry.cn-beijing.aliyuncs.com/prtr/nvlink_collector:1.0.0
+          imagePullPolicy: IfNotPresent
+          # 触发 nvidia runtime 注入 NVML 库+设备 (实测必须, 见 pod 级注释)
+          env:
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+            # utility = 只注入 NVML 管理库, 不注入 CUDA/计算库, 保持轻量
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "utility"
+          # 常驻循环模式: 不带 --once; --output 写入 textfile 目录;
+          # --interval 30 与裸机版 cron 30s 双任务节奏一致
+          args:
+            - --output
+            - /usr/local/node_exporter/extra_metrics_custom/nvlink_status.prom
+            - --interval
+            - "30"
+            - --log-level
+            - INFO
+          resources:
+            # NVML 采集轻量 (实测裸机单轮 ~5s, 多为等待 NvLink ioctl 返回)
+            # 不申请 nvidia.com/gpu 资源, 避免占用 GPU 调度配额
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          # 看门狗的 k8s 等价物:
+          #   liveness probe 是 kubelet 拉起的独立进程, 即使主进程卡死在 NVML
+          #   ioctl 阻塞中, probe 仍能执行 → 失败 3 次 (约 90s) 触发重启 →
+          #   SIGTERM (10s 宽限) → 卡死不退出 → SIGKILL
+          #   语义与 NVLinkMetricsStale 告警一致 (>120s 判定停更)
+          #   灰度实测补充 (2026-10-21): probe 脚本在轻量 busybox/chroot 环境
+          #   中偶现 TTY attach 报错属 debug 工具噪音, 不影响本容器内健康检查;
+          #   正式版保持 simple shell + stat 的最小依赖方案, 兼容 python:slim
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                # .prom mtime 距今超过 120s 说明本轮采集挂死或进程僵死
+                - 'test -e /usr/local/node_exporter/extra_metrics_custom/nvlink_status.prom && test $(( $(date +%s) - $(stat -c %Y /usr/local/node_exporter/extra_metrics_custom/nvlink_status.prom) )) -lt 120'
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
+            timeoutSeconds: 5
+          # 首轮采集是否成功: 文件出现且带 scrape_error 字段即可 (启动即写)
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - 'grep -q "nvlink_last_collection_timestamp" /usr/local/node_exporter/extra_metrics_custom/nvlink_status.prom 2>/dev/null'
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            failureThreshold: 3
+            timeoutSeconds: 5
+          volumeMounts:
+            # 与节点上 node_exporter (Helm DS vmc-mon) 消费的 textfile 目录一致
+            # 注意: 宿主机目录 /usr/local/node_exporter/... 不在集群 hostPath
+            # 白名单内 (workload-hardening 策略), 当前为 audit 模式仅告警不拦截;
+            # 若策略收紧为 Enforce, 需与平台组协调将此路径加入白名单
+            - name: textfile
+              mountPath: /usr/local/node_exporter/extra_metrics_custom
+      volumes:
+        - name: textfile
+          hostPath:
+            path: /usr/local/node_exporter/extra_metrics_custom
+            type: DirectoryOrCreate
+# 注: 该 DaemonSet 产生的指标由既有 vmservicescrape
+#     mon/vmc-mon-vmstack-prometheus-node-exporter (30s) 抓取并经 vmagent
+#     (scrapeInterval 20s) 写入 VictoriaMetrics, 无需新增任何 scrape 配置

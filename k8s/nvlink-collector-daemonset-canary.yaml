@@ -1,0 +1,114 @@
+# NVLink Status Collector - 灰度版 DaemonSet（2 节点先行）
+#
+# 与 k8s/nvlink-collector-daemonset.yaml（全量版）的唯一差异:
+#   nodeSelector 基础上追加 nodeAffinity 硬性点名 2 个灰度节点
+#   —— 纯 Pod spec 级控制，不需要在节点上打任何 label
+#
+# 灰度流程:
+#   1. 先执行 node_exporter 侧变更（部署仓库 vmc.yml + helmwave up，见 DEPLOY_k8s.md 步骤 1）
+#   2. kubectl apply -f k8s/nvlink-collector-daemonset-canary.yaml
+#   3. 按 k8s/CANARY_CHECKLIST.md 逐项验证
+#   4. 验证通过后放量:
+#        kubectl delete -f k8s/nvlink-collector-daemonset-canary.yaml   # 删灰度版
+#        kubectl apply  -f k8s/nvlink-collector-daemonset.yaml           # 上全量版（其余 27 节点开始滚动）
+#   5. 灰度期间回滚: kubectl delete -f k8s/nvlink-collector-daemonset-canary.yaml
+#      影响面仅限 YAML 中点名的 2 个节点，其余 GPU 节点零接触
+#
+# 注意: 若灰度节点名变化，只需改下方 nodeAffinity 的 values 列表，节点对象本身不动
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvlink-collector
+  namespace: mon
+  labels:
+    app: nvlink-collector
+    app.kubernetes.io/name: nvlink-collector
+    app.kubernetes.io/part-of: nvlink-monitoring
+spec:
+  selector:
+    matchLabels:
+      app: nvlink-collector
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: nvlink-collector
+        app.kubernetes.io/name: nvlink-collector
+    spec:
+      # 灰度: nvidia.com/gpu.present=true（保持）AND 节点名 In [2 台灰度机]
+      # 放量: 直接 apply 全量版清单（无 nodeAffinity 段），本 YAML 弃用
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - pod2-b200gpu95    # B200 灰度节点
+                      - pod11-b300gpu20   # B300 灰度节点（跨机型代表）
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      imagePullSecrets:
+        - name: aliyun-yht-private
+      runtimeClassName: nvidia
+      priorityClassName: system-node-critical
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: collector
+          image: registry.cn-beijing.aliyuncs.com/prtr/nvlink_collector:1.0.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "utility"
+          args:
+            - --output
+            - /usr/local/node_exporter/extra_metrics_custom/nvlink_status.prom
+            - --interval
+            - "30"
+            - --log-level
+            - INFO
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - 'test -e /usr/local/node_exporter/extra_metrics_custom/nvlink_status.prom && test $(( $(date +%s) - $(stat -c %Y /usr/local/node_exporter/extra_metrics_custom/nvlink_status.prom) )) -lt 120'
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
+            timeoutSeconds: 5
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - 'grep -q "nvlink_last_collection_timestamp" /usr/local/node_exporter/extra_metrics_custom/nvlink_status.prom 2>/dev/null'
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            failureThreshold: 3
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: textfile
+              mountPath: /usr/local/node_exporter/extra_metrics_custom
+      volumes:
+        - name: textfile
+          hostPath:
+            path: /usr/local/node_exporter/extra_metrics_custom
+            type: DirectoryOrCreate
